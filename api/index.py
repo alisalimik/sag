@@ -10,7 +10,7 @@ import random
 import hashlib
 from urllib.parse import urlparse
 
-import httpx
+import aiohttp
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from starlette.responses import StreamingResponse
@@ -21,6 +21,7 @@ TARGET_BASE = os.environ.get("TARGET_DOMAIN", "").rstrip("/")
 COVER_NAME = os.environ.get("COVER_NAME", "Nimbus Systems")
 COVER_TAGLINE = os.environ.get("COVER_TAGLINE", "Next-Generation Cloud Infrastructure")
 
+# Headers to strip — matches the original JS handler exactly
 _STRIP_REQ = frozenset({
     "host", "connection", "keep-alive", "proxy-authenticate",
     "proxy-authorization", "te", "trailer", "transfer-encoding",
@@ -29,20 +30,34 @@ _STRIP_REQ = frozenset({
 })
 
 _STRIP_RESP = frozenset({
-    "transfer-encoding", "connection", "keep-alive",
+    "transfer-encoding", "connection", "keep-alive", "content-length",
     "proxy-authenticate", "proxy-authorization", "te", "trailer",
 })
 
 _BOOT = int(time.time())
 _ETAG = hashlib.md5(f"{_BOOT}{random.random()}".encode()).hexdigest()[:12]
 
-# ── Shared async HTTP client (pooled across warm invocations) ─
+# ── Shared aiohttp session (reused across warm invocations) ──
 
-_http = httpx.AsyncClient(
-    follow_redirects=False,
-    timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
-    http2=True,
-)
+_session: aiohttp.ClientSession | None = None
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        timeout = aiohttp.ClientTimeout(
+            total=None,        # no total limit — match Edge runtime behavior
+            connect=15,
+            sock_read=None,    # no read timeout — stream until done
+            sock_connect=15,
+        )
+        _session = aiohttp.ClientSession(
+            timeout=timeout,
+            auto_decompress=False,   # pass through raw bytes like JS fetch
+            skip_auto_headers={"User-Agent"},
+        )
+    return _session
+
 
 # ── App ──────────────────────────────────────────────────────
 
@@ -87,7 +102,6 @@ async def robots_txt():
 
 @app.get("/favicon.ico")
 async def favicon():
-    # 1x1 transparent ICO
     ico = (b"\x00\x00\x01\x00\x01\x00\x01\x01\x00\x00\x01\x00\x18\x00"
            b"\x30\x00\x00\x00\x16\x00\x00\x00\x28\x00\x00\x00\x01\x00"
            b"\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00"
@@ -125,7 +139,7 @@ async def ws_handler(ws: WebSocket, path: str):
 
     await ws.accept()
 
-    import websockets.client as wsc
+    session = await _get_session()
 
     try:
         extra_headers = {}
@@ -142,11 +156,10 @@ async def ws_handler(ws: WebSocket, path: str):
         if client_ip:
             extra_headers["x-forwarded-for"] = client_ip.split(",")[0].strip()
 
-        async with wsc.connect(
+        async with session.ws_connect(
             target_ws,
-            additional_headers=extra_headers,
-            close_timeout=5,
-            open_timeout=10,
+            headers=extra_headers,
+            timeout=15,
         ) as upstream:
             done = asyncio.Event()
 
@@ -157,9 +170,9 @@ async def ws_handler(ws: WebSocket, path: str):
                         if msg.get("type") == "websocket.disconnect":
                             break
                         if "text" in msg and msg["text"] is not None:
-                            await upstream.send(msg["text"])
+                            await upstream.send_str(msg["text"])
                         elif "bytes" in msg and msg["bytes"] is not None:
-                            await upstream.send(msg["bytes"])
+                            await upstream.send_bytes(msg["bytes"])
                 except (WebSocketDisconnect, Exception):
                     pass
                 finally:
@@ -170,10 +183,14 @@ async def ws_handler(ws: WebSocket, path: str):
                     async for frame in upstream:
                         if done.is_set():
                             break
-                        if isinstance(frame, str):
-                            await ws.send_text(frame)
-                        else:
-                            await ws.send_bytes(frame)
+                        if frame.type == aiohttp.WSMsgType.TEXT:
+                            await ws.send_text(frame.data)
+                        elif frame.type == aiohttp.WSMsgType.BINARY:
+                            await ws.send_bytes(frame.data)
+                        elif frame.type in (aiohttp.WSMsgType.CLOSE,
+                                            aiohttp.WSMsgType.CLOSING,
+                                            aiohttp.WSMsgType.CLOSED):
+                            break
                 except Exception:
                     pass
                 finally:
@@ -189,22 +206,11 @@ async def ws_handler(ws: WebSocket, path: str):
             pass
 
 
-# ── HTTP handler (catch-all) ─────────────────────────────────
+# ── HTTP handler (catch-all) — mirrors JS fetch() logic ──────
 
-@app.api_route("/{path:path}",
-               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def http_handler(request: Request, path: str):
-    if not TARGET_BASE:
-        return Response("Service Unavailable", status_code=503,
-                        headers=_stealth({}))
-
-    target_url = f"{TARGET_BASE}/{path}"
-    qs = str(request.query_params)
-    if qs:
-        target_url += f"?{qs}"
-
-    # Build outgoing headers
-    out_headers = {}
+def _filter_req_headers(request: Request) -> dict:
+    """Single-pass header filter — identical logic to the JS version."""
+    out = {}
     client_ip = None
     for k, v in request.headers.items():
         lk = k.lower()
@@ -217,46 +223,78 @@ async def http_handler(request: Request, path: str):
             if not client_ip:
                 client_ip = v
             continue
-        out_headers[k] = v
+        out[k] = v
     if client_ip:
-        out_headers["x-forwarded-for"] = client_ip.split(",")[0].strip()
+        out["x-forwarded-for"] = client_ip.split(",")[0].strip()
+    return out
 
+
+async def _read_body(request: Request):
+    """Async generator that yields request body chunks as they arrive."""
+    async for chunk in request.stream():
+        if chunk:
+            yield chunk
+
+
+@app.api_route("/{path:path}",
+               methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def http_handler(request: Request, path: str):
+    if not TARGET_BASE:
+        return Response("Service Unavailable", status_code=503,
+                        headers=_stealth({}))
+
+    # Build target URL — same as JS: TARGET_BASE + "/" + path + query
+    target_url = f"{TARGET_BASE}/{path}"
+    qs = str(request.query_params)
+    if qs:
+        target_url += f"?{qs}"
+
+    out_headers = _filter_req_headers(request)
     method = request.method
     has_body = method not in ("GET", "HEAD", "OPTIONS")
 
+    session = await _get_session()
+
     try:
-        # Build request and send with stream=True so we get headers
-        # immediately and body chunks flow lazily — no buffering.
-        req = _http.build_request(
+        # This mirrors JS: fetch(targetUrl, { method, headers, body, redirect: "manual" })
+        # aiohttp.request() returns immediately once response headers arrive.
+        # The request body streams via the async generator.
+        # The response body is NOT buffered — we iterate it chunk by chunk.
+        upstream = await session.request(
             method=method,
             url=target_url,
             headers=out_headers,
-            content=request.stream() if has_body else None,
+            data=_read_body(request) if has_body else None,
+            allow_redirects=False,      # same as redirect: "manual"
+            skip_auto_headers={"Content-Type"} if not has_body else set(),
         )
-        upstream = await _http.send(req, stream=True)
 
-        # Normalize response headers
+        # Build response headers — strip hop-by-hop, add stealth
         resp_headers = {}
-        for k, v in upstream.headers.multi_items():
+        for k, v in upstream.headers.items():
             if k.lower() in _STRIP_RESP:
                 continue
             resp_headers[k] = v
         _stealth(resp_headers)
 
-        # Yield body chunks as they arrive; close when done
+        # Stream response body chunk by chunk — no buffering
         async def body_stream():
             try:
-                async for chunk in upstream.aiter_bytes(chunk_size=65536):
+                while True:
+                    chunk = await upstream.content.read(65536)
+                    if not chunk:
+                        break
                     yield chunk
             finally:
-                await upstream.aclose()
+                upstream.release()
 
         return StreamingResponse(
             content=body_stream(),
-            status_code=upstream.status_code,
+            status_code=upstream.status,
             headers=resp_headers,
         )
-    except httpx.TimeoutException:
+
+    except asyncio.TimeoutError:
         return Response("Gateway Timeout", status_code=504,
                         headers=_stealth({"content-type": "text/plain"}))
     except Exception:
@@ -425,9 +463,9 @@ footer a:hover{{color:var(--text)}}
 </main>
 
 <footer><div class="container">
-  <p>&copy; {year} {COVER_NAME}, Inc. &nbsp;·&nbsp;
-     <a href="#">Terms</a> &nbsp;·&nbsp;
-     <a href="#">Privacy</a> &nbsp;·&nbsp;
+  <p>&copy; {year} {COVER_NAME}, Inc. &nbsp;&middot;&nbsp;
+     <a href="#">Terms</a> &nbsp;&middot;&nbsp;
+     <a href="#">Privacy</a> &nbsp;&middot;&nbsp;
      <a href="#">Status</a></p>
 </div></footer>
 </body>
