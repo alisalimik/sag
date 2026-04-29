@@ -225,12 +225,15 @@ async def http_handler(request: Request, path: str):
     has_body = method not in ("GET", "HEAD", "OPTIONS")
 
     try:
-        upstream = await _http.request(
+        # Build request and send with stream=True so we get headers
+        # immediately and body chunks flow lazily — no buffering.
+        req = _http.build_request(
             method=method,
             url=target_url,
             headers=out_headers,
             content=request.stream() if has_body else None,
         )
+        upstream = await _http.send(req, stream=True)
 
         # Normalize response headers
         resp_headers = {}
@@ -240,11 +243,13 @@ async def http_handler(request: Request, path: str):
             resp_headers[k] = v
         _stealth(resp_headers)
 
-        # Stream response body
+        # Yield body chunks as they arrive; close when done
         async def body_stream():
-            async for chunk in upstream.aiter_bytes(chunk_size=65536):
-                yield chunk
-            await upstream.aclose()
+            try:
+                async for chunk in upstream.aiter_bytes(chunk_size=65536):
+                    yield chunk
+            finally:
+                await upstream.aclose()
 
         return StreamingResponse(
             content=body_stream(),
